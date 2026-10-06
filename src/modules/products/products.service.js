@@ -1,0 +1,693 @@
+const pool = require("../../config/database");
+
+const ensureProductsColumns = async () => {
+  try {
+    await pool.query(`
+      ALTER TABLE products ADD COLUMN IF NOT EXISTS tags VARCHAR(255) DEFAULT '';
+    `);
+  } catch (migErr) {
+    console.warn("⚠️ products.service auto-migration notice:", migErr.message);
+  }
+};
+
+const ALL_PRODUCTS_QUERY = `
+    SELECT
+      p.id,
+      p.product_code,
+      p.name,
+      p.description,
+      p.price,
+      p.cost_price,
+      p.staff_price,
+      p.unit,
+      p.image_url,
+      p.is_available,
+      p.is_active,
+      p.menu_type,
+      p.is_todays_special,
+      p.parent_product_id,
+      p.portion_ratio,
+      p.serving_size,
+      p.shots_capacity,
+      p.is_shot_item,
+      p.double_shot_price,
+      p.half_bottle_price,
+      p.bottle_price,
+      COALESCE(p.allow_single_shot, TRUE) AS allow_single_shot,
+      COALESCE(p.allow_double_shot, TRUE) AS allow_double_shot,
+      COALESCE(p.allow_half_bottle, TRUE) AS allow_half_bottle,
+      COALESCE(p.allow_full_bottle, TRUE) AS allow_full_bottle,
+      COALESCE(p.applicable_for, 'both') AS applicable_for,
+      COALESCE(p.tags, '') AS tags,
+      parent_p.name AS parent_product_name,
+      p.created_at,
+      p.updated_at,
+
+      pc.id AS category_id,
+      pc.name AS category_name,
+      pc.type AS category_type,
+
+      -- Real-time Department & Warehouse stock
+      COALESCE(b.quantity, 0)::NUMERIC(12,2) AS bar_stock,
+      COALESCE(b.minimum_stock, p.low_stock_threshold, 5)::NUMERIC(12,2) AS bar_min_stock,
+      COALESCE(b.out_of_stock_threshold, p.out_of_stock_threshold, 0)::NUMERIC(12,2) AS bar_out_of_stock_threshold,
+      COALESCE(k.quantity, 0)::NUMERIC(12,2) AS kitchen_stock,
+      COALESCE(k.minimum_stock, p.low_stock_threshold, 5)::NUMERIC(12,2) AS kitchen_min_stock,
+      COALESCE(k.out_of_stock_threshold, p.out_of_stock_threshold, 0)::NUMERIC(12,2) AS kitchen_out_of_stock_threshold,
+      COALESCE(i.quantity, 0)::NUMERIC(12,2) AS main_stock,
+      COALESCE(i.minimum_stock, p.low_stock_threshold, 0)::NUMERIC(12,2) AS main_min_stock,
+
+      -- Product Default Thresholds
+      COALESCE(p.low_stock_threshold, 5)::NUMERIC(12,2) AS low_stock_threshold,
+      COALESCE(p.out_of_stock_threshold, 0)::NUMERIC(12,2) AS out_of_stock_threshold,
+
+      -- Department-resolved current stock
+      CASE
+        WHEN p.portion_ratio > 0 AND LOWER(COALESCE(pc.type, '')) IN ('beverage', 'bar')
+          THEN FLOOR(COALESCE(b.quantity, 0) / p.portion_ratio)::NUMERIC(12,2)
+        WHEN LOWER(COALESCE(pc.type, '')) = 'food' THEN COALESCE(k.quantity, 0)::NUMERIC(12,2)
+        WHEN LOWER(COALESCE(pc.type, '')) IN ('beverage', 'bar') THEN COALESCE(b.quantity, 0)::NUMERIC(12,2)
+        ELSE (COALESCE(b.quantity, 0) + COALESCE(k.quantity, 0) + COALESCE(i.quantity, 0))::NUMERIC(12,2)
+      END AS current_stock,
+
+      -- Department-resolved minimum stock
+      CASE
+        WHEN LOWER(COALESCE(pc.type, '')) = 'food' THEN COALESCE(k.minimum_stock, p.low_stock_threshold, 5)::NUMERIC(12,2)
+        WHEN LOWER(COALESCE(pc.type, '')) IN ('beverage', 'bar') THEN COALESCE(b.minimum_stock, p.low_stock_threshold, 5)::NUMERIC(12,2)
+        ELSE COALESCE(i.minimum_stock, p.low_stock_threshold, 5)::NUMERIC(12,2)
+      END AS minimum_stock,
+
+      -- Department-resolved out of stock threshold
+      CASE
+        WHEN LOWER(COALESCE(pc.type, '')) = 'food' THEN COALESCE(k.out_of_stock_threshold, p.out_of_stock_threshold, 0)::NUMERIC(12,2)
+        WHEN LOWER(COALESCE(pc.type, '')) IN ('beverage', 'bar') THEN COALESCE(b.out_of_stock_threshold, p.out_of_stock_threshold, 0)::NUMERIC(12,2)
+        ELSE COALESCE(p.out_of_stock_threshold, 0)::NUMERIC(12,2)
+      END AS out_of_stock_threshold_resolved,
+
+      -- Department name
+      CASE
+        WHEN LOWER(COALESCE(pc.type, '')) = 'food' THEN 'Kitchen'
+        WHEN LOWER(COALESCE(pc.type, '')) IN ('beverage', 'bar') THEN 'Bar'
+        ELSE 'Store'
+      END AS stock_department
+
+    FROM products p
+
+    LEFT JOIN product_categories pc
+      ON p.category_id = pc.id
+
+    LEFT JOIN products parent_p
+      ON p.parent_product_id = parent_p.id
+
+    LEFT JOIN department_inventory b
+      ON COALESCE(p.parent_product_id, p.id) = b.product_id AND b.department = 'bar'
+
+    LEFT JOIN department_inventory k
+      ON COALESCE(p.parent_product_id, p.id) = k.product_id AND k.department = 'kitchen'
+
+    LEFT JOIN inventory i
+      ON COALESCE(p.parent_product_id, p.id) = i.product_id
+
+    ORDER BY p.created_at DESC
+`;
+
+// Get all products
+const getAllProducts = async () => {
+  try {
+    const result = await pool.query(ALL_PRODUCTS_QUERY);
+    return result.rows;
+  } catch (err) {
+    if (err.code === "42703") {
+      await ensureProductsColumns();
+      const retryResult = await pool.query(ALL_PRODUCTS_QUERY);
+      return retryResult.rows;
+    }
+    throw err;
+  }
+};
+
+const GET_PRODUCT_BY_ID_QUERY = `
+    SELECT
+      p.id,
+      p.product_code,
+      p.name,
+      p.description,
+      p.price,
+      p.cost_price,
+      p.staff_price,
+      p.unit,
+      p.image_url,
+      p.is_available,
+      p.is_active,
+      p.menu_type,
+      p.is_todays_special,
+      p.parent_product_id,
+      p.portion_ratio,
+      p.serving_size,
+      p.shots_capacity,
+      p.is_shot_item,
+      p.double_shot_price,
+      p.half_bottle_price,
+      p.bottle_price,
+      COALESCE(p.allow_single_shot, TRUE) AS allow_single_shot,
+      COALESCE(p.allow_double_shot, TRUE) AS allow_double_shot,
+      COALESCE(p.allow_half_bottle, TRUE) AS allow_half_bottle,
+      COALESCE(p.allow_full_bottle, TRUE) AS allow_full_bottle,
+      COALESCE(p.applicable_for, 'both') AS applicable_for,
+      COALESCE(p.tags, '') AS tags,
+      COALESCE(p.low_stock_threshold, 5)::NUMERIC(12,2) AS low_stock_threshold,
+      COALESCE(p.out_of_stock_threshold, 0)::NUMERIC(12,2) AS out_of_stock_threshold,
+      parent_p.name AS parent_product_name,
+      p.created_at,
+      p.updated_at,
+
+      pc.id AS category_id,
+      pc.name AS category_name,
+      pc.type AS category_type
+
+    FROM products p
+
+    LEFT JOIN product_categories pc
+      ON p.category_id = pc.id
+
+    LEFT JOIN products parent_p
+      ON p.parent_product_id = parent_p.id
+
+    WHERE p.id = $1
+`;
+
+// Get product by ID
+const getProductById = async (id) => {
+  try {
+    const result = await pool.query(GET_PRODUCT_BY_ID_QUERY, [id]);
+    return result.rows[0];
+  } catch (err) {
+    if (err.code === "42703") {
+      await ensureProductsColumns();
+      const retryResult = await pool.query(GET_PRODUCT_BY_ID_QUERY, [id]);
+      return retryResult.rows[0];
+    }
+    throw err;
+  }
+};
+
+
+// Create product
+const createProduct = async (data) => {
+  const {
+    productCode,
+    name,
+    categoryId,
+    description,
+    price,
+    costPrice,
+    staffPrice,
+    unit,
+    imageUrl,
+    isAvailable,
+    isActive,
+    menuType,
+    isTodaysSpecial,
+    parentProductId,
+    portionRatio,
+    servingSize,
+    lowStockThreshold,
+    outOfStockThreshold,
+    applicable_for,
+    applicableFor,
+  } = data;
+
+  const resolvedApplicableFor = applicable_for || applicableFor || "both";
+  const shotsCapacity = data.shotsCapacity !== undefined ? data.shotsCapacity : data.shots_capacity;
+  const isShotItem = data.isShotItem !== undefined ? data.isShotItem : data.is_shot_item;
+  const tags = (data.tags || data.tag || "").trim();
+
+  const doubleShotPrice = data.doubleShotPrice !== undefined && data.doubleShotPrice !== "" && data.doubleShotPrice !== null ? Number(data.doubleShotPrice) : (data.double_shot_price !== undefined && data.double_shot_price !== "" && data.double_shot_price !== null ? Number(data.double_shot_price) : null);
+  const halfBottlePrice = data.halfBottlePrice !== undefined && data.halfBottlePrice !== "" && data.halfBottlePrice !== null ? Number(data.halfBottlePrice) : (data.half_bottle_price !== undefined && data.half_bottle_price !== "" && data.half_bottle_price !== null ? Number(data.half_bottle_price) : null);
+  const bottlePrice = data.bottlePrice !== undefined && data.bottlePrice !== "" && data.bottlePrice !== null ? Number(data.bottlePrice) : (data.bottle_price !== undefined && data.bottle_price !== "" && data.bottle_price !== null ? Number(data.bottle_price) : null);
+
+  const allowSingleShot = data.allowSingleShot !== undefined ? (data.allowSingleShot === true || data.allowSingleShot === "true" || data.allowSingleShot === 1 || data.allowSingleShot === "1") : (data.allow_single_shot !== undefined ? (data.allow_single_shot === true || data.allow_single_shot === "true" || data.allow_single_shot === 1 || data.allow_single_shot === "1") : true);
+  const allowDoubleShot = data.allowDoubleShot !== undefined ? (data.allowDoubleShot === true || data.allowDoubleShot === "true" || data.allowDoubleShot === 1 || data.allowDoubleShot === "1") : (data.allow_double_shot !== undefined ? (data.allow_double_shot === true || data.allow_double_shot === "true" || data.allow_double_shot === 1 || data.allow_double_shot === "1") : true);
+  const allowHalfBottle = data.allowHalfBottle !== undefined ? (data.allowHalfBottle === true || data.allowHalfBottle === "true" || data.allowHalfBottle === 1 || data.allowHalfBottle === "1") : (data.allow_half_bottle !== undefined ? (data.allow_half_bottle === true || data.allow_half_bottle === "true" || data.allow_half_bottle === 1 || data.allow_half_bottle === "1") : true);
+  const allowFullBottle = data.allowFullBottle !== undefined ? (data.allowFullBottle === true || data.allowFullBottle === "true" || data.allowFullBottle === 1 || data.allowFullBottle === "1") : (data.allow_full_bottle !== undefined ? (data.allow_full_bottle === true || data.allow_full_bottle === "true" || data.allow_full_bottle === 1 || data.allow_full_bottle === "1") : true);
+
+  let resolvedProductCode = (productCode || data.product_code || "").trim();
+
+  // If no product code provided, auto-generate sequential code by category
+  if (!resolvedProductCode && (categoryId || data.category_id)) {
+    const targetCatId = categoryId || data.category_id;
+    try {
+      const catRes = await pool.query(
+        `SELECT name, type FROM product_categories WHERE id = $1`,
+        [targetCatId]
+      );
+      const catName = (catRes.rows[0]?.name || "").toUpperCase();
+      const catType = (catRes.rows[0]?.type || "").toUpperCase();
+
+      let prefix = "PRD";
+      if (catName.includes("FRUIT")) prefix = "FR";
+      else if (catName.includes("FOOD")) prefix = "FD";
+      else if (catName.includes("BEVERAGE") || catName.includes("SOFT")) prefix = "BV";
+      else if (catName.includes("BAR") || catName.includes("LIQUOR") || catName.includes("SPIRIT")) prefix = "BR";
+      else if (catName.includes("SUPPL") || catName.includes("KITCHEN")) prefix = "KS";
+      else if (catName.includes("DESSERT")) prefix = "DS";
+      else if (catName.includes("SALAD")) prefix = "SL";
+      else if (catType === "FOOD") prefix = "FD";
+      else if (catType === "BAR") prefix = "BR";
+      else if (catType === "BEVERAGE") prefix = "BV";
+      else if (catType === "SUPPLY") prefix = "KS";
+      else {
+        const clean = catName.replace(/[^A-Z0-9]/g, "");
+        prefix = clean.slice(0, 3) || "PRD";
+      }
+
+      const codeRes = await pool.query(
+        `SELECT product_code FROM products WHERE product_code LIKE $1`,
+        [`${prefix}-%`]
+      );
+
+      let maxNum = 0;
+      for (const row of codeRes.rows) {
+        const num = parseInt((row.product_code || "").replace(`${prefix}-`, ""), 10);
+        if (!isNaN(num) && num > maxNum) maxNum = num;
+      }
+
+      resolvedProductCode = `${prefix}-${String(maxNum + 1).padStart(3, "0")}`;
+    } catch (e) {
+      console.warn("Auto product code generation fallback:", e);
+    }
+  }
+
+  const result = await pool.query(
+    `
+    INSERT INTO products (
+      product_code,
+      name,
+      category_id,
+      description,
+      price,
+      cost_price,
+      staff_price,
+      unit,
+      image_url,
+      is_available,
+      is_active,
+      menu_type,
+      is_todays_special,
+      parent_product_id,
+      portion_ratio,
+      serving_size,
+      shots_capacity,
+      is_shot_item,
+      double_shot_price,
+      half_bottle_price,
+      bottle_price,
+      allow_single_shot,
+      allow_double_shot,
+      allow_half_bottle,
+      allow_full_bottle,
+      low_stock_threshold,
+      out_of_stock_threshold,
+      applicable_for,
+      tags
+    )
+    VALUES (
+      $1, $2, $3, $4, $5,
+      $6, $7, $8, $9,
+      COALESCE($10, TRUE),
+      COALESCE($11, TRUE),
+      COALESCE($12, 'both'),
+      COALESCE($13, FALSE),
+      $14,
+      COALESCE($15, 1.0000),
+      COALESCE($16, 'unit'),
+      COALESCE($17, 0),
+      COALESCE($18, FALSE),
+      $19::numeric,
+      $20::numeric,
+      $21::numeric,
+      COALESCE($22::boolean, TRUE),
+      COALESCE($23::boolean, TRUE),
+      COALESCE($24::boolean, TRUE),
+      COALESCE($25::boolean, TRUE),
+      COALESCE($26, 5),
+      COALESCE($27, 0),
+      COALESCE($28, 'both'),
+      COALESCE($29, '')
+    )
+    RETURNING *
+    `,
+    [
+      resolvedProductCode || null,
+      name,
+      categoryId || null,
+      description || null,
+      price || 0,
+      costPrice || 0,
+      staffPrice || 0,
+      unit || "pcs",
+      imageUrl || null,
+      isAvailable,
+      isActive,
+      menuType || "both",
+      isTodaysSpecial || false,
+      parentProductId || null,
+      portionRatio !== undefined && portionRatio !== null ? Number(portionRatio) : 1.0,
+      servingSize || "unit",
+      (isShotItem === true || isShotItem === "true" || isShotItem === 1 || isShotItem === "1") && shotsCapacity !== undefined && shotsCapacity !== null && shotsCapacity !== "" ? parseInt(shotsCapacity, 10) : 0,
+      isShotItem !== undefined && isShotItem !== null ? (isShotItem === true || isShotItem === "true" || isShotItem === 1 || isShotItem === "1") : false,
+      doubleShotPrice,
+      halfBottlePrice,
+      bottlePrice,
+      allowSingleShot,
+      allowDoubleShot,
+      allowHalfBottle,
+      allowFullBottle,
+      lowStockThreshold !== undefined && lowStockThreshold !== null ? Number(lowStockThreshold) : 5,
+      outOfStockThreshold !== undefined && outOfStockThreshold !== null ? Number(outOfStockThreshold) : 0,
+      resolvedApplicableFor,
+      tags,
+    ]
+  );
+
+  return result.rows[0];
+};
+
+
+// Update product
+const updateProduct = async (id, data) => {
+  const {
+    productCode,
+    name,
+    categoryId,
+    description,
+    price,
+    costPrice,
+    staffPrice,
+    unit,
+    imageUrl,
+    isAvailable,
+    isActive,
+    menuType,
+    isTodaysSpecial,
+    parentProductId,
+    portionRatio,
+    servingSize,
+    lowStockThreshold,
+    outOfStockThreshold,
+    applicable_for,
+    applicableFor,
+  } = data;
+
+  const resolvedApplicableFor =
+    applicable_for !== undefined
+      ? applicable_for
+      : applicableFor !== undefined
+      ? applicableFor
+      : null;
+
+  const shotsCapacity = data.shotsCapacity !== undefined ? data.shotsCapacity : data.shots_capacity;
+  const isShotItem = data.isShotItem !== undefined ? data.isShotItem : data.is_shot_item;
+  const tags = data.tags !== undefined ? String(data.tags).trim() : (data.tag !== undefined ? String(data.tag).trim() : null);
+
+  const doubleShotPrice = data.doubleShotPrice !== undefined ? (data.doubleShotPrice === "" || data.doubleShotPrice === null ? "null" : Number(data.doubleShotPrice)) : (data.double_shot_price !== undefined ? (data.double_shot_price === "" || data.double_shot_price === null ? "null" : Number(data.double_shot_price)) : null);
+  const halfBottlePrice = data.halfBottlePrice !== undefined ? (data.halfBottlePrice === "" || data.halfBottlePrice === null ? "null" : Number(data.halfBottlePrice)) : (data.half_bottle_price !== undefined ? (data.half_bottle_price === "" || data.half_bottle_price === null ? "null" : Number(data.half_bottle_price)) : null);
+  const bottlePrice = data.bottlePrice !== undefined ? (data.bottlePrice === "" || data.bottlePrice === null ? "null" : Number(data.bottlePrice)) : (data.bottle_price !== undefined ? (data.bottle_price === "" || data.bottle_price === null ? "null" : Number(data.bottle_price)) : null);
+
+  const allowSingleShot = data.allowSingleShot !== undefined ? (data.allowSingleShot === true || data.allowSingleShot === "true" || data.allowSingleShot === 1 || data.allowSingleShot === "1") : (data.allow_single_shot !== undefined ? (data.allow_single_shot === true || data.allow_single_shot === "true" || data.allow_single_shot === 1 || data.allow_single_shot === "1") : null);
+  const allowDoubleShot = data.allowDoubleShot !== undefined ? (data.allowDoubleShot === true || data.allowDoubleShot === "true" || data.allowDoubleShot === 1 || data.allowDoubleShot === "1") : (data.allow_double_shot !== undefined ? (data.allow_double_shot === true || data.allow_double_shot === "true" || data.allow_double_shot === 1 || data.allow_double_shot === "1") : null);
+  const allowHalfBottle = data.allowHalfBottle !== undefined ? (data.allowHalfBottle === true || data.allowHalfBottle === "true" || data.allowHalfBottle === 1 || data.allowHalfBottle === "1") : (data.allow_half_bottle !== undefined ? (data.allow_half_bottle === true || data.allow_half_bottle === "true" || data.allow_half_bottle === 1 || data.allow_half_bottle === "1") : null);
+  const allowFullBottle = data.allowFullBottle !== undefined ? (data.allowFullBottle === true || data.allowFullBottle === "true" || data.allowFullBottle === 1 || data.allowFullBottle === "1") : (data.allow_full_bottle !== undefined ? (data.allow_full_bottle === true || data.allow_full_bottle === "true" || data.allow_full_bottle === 1 || data.allow_full_bottle === "1") : null);
+
+  const result = await pool.query(
+    `
+    UPDATE products
+    SET
+      product_code = COALESCE($1, product_code),
+      name = COALESCE($2, name),
+      category_id = COALESCE($3, category_id),
+      description = COALESCE($4, description),
+      price = COALESCE($5, price),
+      cost_price = COALESCE($6, cost_price),
+      staff_price = COALESCE($7, staff_price),
+      unit = COALESCE($8, unit),
+      image_url = COALESCE($9, image_url),
+      is_available = COALESCE($10, is_available),
+      is_active = COALESCE($11, is_active),
+      menu_type = COALESCE($12, menu_type),
+      is_todays_special = COALESCE($13, is_todays_special),
+      parent_product_id = CASE WHEN $14::text = 'null' THEN NULL WHEN $14::integer IS NOT NULL THEN $14::integer ELSE parent_product_id END,
+      portion_ratio = COALESCE($15::numeric, portion_ratio),
+      serving_size = COALESCE($16, serving_size),
+      shots_capacity = COALESCE($17::integer, shots_capacity),
+      is_shot_item = COALESCE($18::boolean, is_shot_item),
+      double_shot_price = CASE WHEN $19::text = 'null' THEN NULL WHEN $19::numeric IS NOT NULL THEN $19::numeric ELSE double_shot_price END,
+      half_bottle_price = CASE WHEN $20::text = 'null' THEN NULL WHEN $20::numeric IS NOT NULL THEN $20::numeric ELSE half_bottle_price END,
+      bottle_price = CASE WHEN $21::text = 'null' THEN NULL WHEN $21::numeric IS NOT NULL THEN $21::numeric ELSE bottle_price END,
+      allow_single_shot = COALESCE($22::boolean, allow_single_shot),
+      allow_double_shot = COALESCE($23::boolean, allow_double_shot),
+      allow_half_bottle = COALESCE($24::boolean, allow_half_bottle),
+      allow_full_bottle = COALESCE($25::boolean, allow_full_bottle),
+      low_stock_threshold = COALESCE($26::numeric, low_stock_threshold),
+      out_of_stock_threshold = COALESCE($27::numeric, out_of_stock_threshold),
+      applicable_for = COALESCE($28, applicable_for),
+      tags = COALESCE($29, tags),
+      updated_at = CURRENT_TIMESTAMP
+    WHERE id = $30::integer
+    RETURNING *
+    `,
+    [
+      productCode,
+      name,
+      categoryId,
+      description,
+      price,
+      costPrice,
+      staffPrice,
+      unit,
+      imageUrl,
+      isAvailable,
+      isActive,
+      menuType,
+      isTodaysSpecial,
+      parentProductId !== undefined ? parentProductId : null,
+      portionRatio !== undefined ? Number(portionRatio) : null,
+      servingSize !== undefined ? servingSize : null,
+      (isShotItem === true || isShotItem === "true" || isShotItem === 1 || isShotItem === "1") && shotsCapacity !== undefined && shotsCapacity !== null && shotsCapacity !== ""
+        ? parseInt(shotsCapacity, 10)
+        : (isShotItem === false || isShotItem === "false" || isShotItem === 0 || isShotItem === "0" ? 0 : null),
+      isShotItem !== undefined && isShotItem !== null ? (isShotItem === true || isShotItem === "true" || isShotItem === 1 || isShotItem === "1") : null,
+      doubleShotPrice,
+      halfBottlePrice,
+      bottlePrice,
+      allowSingleShot,
+      allowDoubleShot,
+      allowHalfBottle,
+      allowFullBottle,
+      lowStockThreshold !== undefined && lowStockThreshold !== null ? Number(lowStockThreshold) : null,
+      outOfStockThreshold !== undefined && outOfStockThreshold !== null ? Number(outOfStockThreshold) : null,
+      resolvedApplicableFor,
+      tags,
+      id,
+    ]
+  );
+
+  return result.rows[0];
+};
+
+
+// Delete product
+// We deactivate instead of physically deleting it.
+const deleteProduct = async (id) => {
+  const result = await pool.query(
+    `
+    UPDATE products
+    SET
+      is_active = FALSE,
+      is_available = FALSE,
+      updated_at = CURRENT_TIMESTAMP
+    WHERE id = $1
+    RETURNING *
+    `,
+    [id]
+  );
+
+  return result.rows[0];
+};
+
+
+// Get product categories
+const getCategories = async () => {
+  try {
+    await pool.query(`
+      INSERT INTO product_categories (name, description, type)
+      VALUES 
+        ('Food', 'All kitchen food and meals', 'food'),
+        ('Drink', 'All beverages, bar items and drinks', 'bar'),
+        ('Fruit', 'Fresh fruit items', 'food')
+      ON CONFLICT (name) DO NOTHING
+    `);
+  } catch (err) {
+    // If table or constraint is not yet present, silently fall through
+  }
+
+  const result = await pool.query(`
+    SELECT
+      id,
+      name,
+      description,
+      type,
+      created_at
+    FROM product_categories
+    ORDER BY name ASC
+  `);
+
+  return result.rows;
+};
+
+
+// Create category
+const createCategory = async (data) => {
+  const {
+    name,
+    description,
+    type,
+  } = data;
+
+  const result = await pool.query(
+    `
+    INSERT INTO product_categories (
+      name,
+      description,
+      type
+    )
+    VALUES ($1, $2, $3)
+    RETURNING *
+    `,
+    [
+      name,
+      description || null,
+      type || "food",
+    ]
+  );
+
+  return result.rows[0];
+};
+
+
+// ============================================================
+// GET MENU (CUSTOMER vs EMPLOYEE / STAFF)
+// ============================================================
+const getMenu = async (menuType) => {
+  let query = `
+    SELECT
+      p.id,
+      p.product_code,
+      p.name,
+      p.description,
+      p.price,
+      p.cost_price,
+      p.staff_price,
+      p.unit,
+      p.image_url,
+      p.is_available,
+      p.is_active,
+      p.menu_type,
+      p.is_todays_special,
+      p.parent_product_id,
+      p.portion_ratio,
+      p.serving_size,
+      p.shots_capacity,
+      p.is_shot_item,
+      p.double_shot_price,
+      p.half_bottle_price,
+      p.bottle_price,
+      COALESCE(p.allow_single_shot, TRUE) AS allow_single_shot,
+      COALESCE(p.allow_double_shot, TRUE) AS allow_double_shot,
+      COALESCE(p.allow_half_bottle, TRUE) AS allow_half_bottle,
+      COALESCE(p.allow_full_bottle, TRUE) AS allow_full_bottle,
+      COALESCE(p.applicable_for, 'both') AS applicable_for,
+      p.created_at,
+      p.updated_at,
+
+      pc.id AS category_id,
+      pc.name AS category_name,
+      pc.type AS category_type
+
+    FROM products p
+
+    LEFT JOIN product_categories pc
+      ON p.category_id = pc.id
+
+    WHERE p.is_active = TRUE AND p.is_available = TRUE
+  `;
+
+  const values = [];
+
+  if (menuType === "customer") {
+    query += ` AND (p.menu_type = 'customer' OR p.menu_type = 'both')`;
+  } else if (menuType === "employee") {
+    query += ` AND (p.menu_type = 'employee' OR p.menu_type = 'both')`;
+  }
+
+  query += ` ORDER BY pc.name ASC, p.name ASC`;
+
+  const result = await pool.query(query, values);
+  return result.rows;
+};
+
+
+// ============================================================
+// UPDATE PRODUCT MENU SETTINGS (FOR MANAGERS)
+// ============================================================
+const updateProductMenu = async (id, data) => {
+  const {
+    menuType,
+    isAvailable,
+    isTodaysSpecial,
+    staffPrice,
+    isActive,
+    is_active,
+  } = data;
+
+  const resolvedIsActive = isActive !== undefined ? isActive : is_active;
+
+  const result = await pool.query(
+    `
+    UPDATE products
+    SET
+      menu_type = COALESCE($1, menu_type),
+      is_available = COALESCE($2, is_available),
+      is_todays_special = COALESCE($3, is_todays_special),
+      staff_price = COALESCE($4, staff_price),
+      is_active = COALESCE($5, is_active),
+      updated_at = CURRENT_TIMESTAMP
+    WHERE id = $6
+    RETURNING *
+    `,
+    [
+      menuType || null,
+      isAvailable !== undefined ? isAvailable : null,
+      isTodaysSpecial !== undefined ? isTodaysSpecial : null,
+      staffPrice !== undefined ? staffPrice : null,
+      resolvedIsActive !== undefined ? resolvedIsActive : null,
+      id,
+    ]
+  );
+
+  return result.rows[0];
+};
+
+
+module.exports = {
+  getAllProducts,
+  getProductById,
+  createProduct,
+  updateProduct,
+  deleteProduct,
+  getCategories,
+  createCategory,
+
+  getMenu,
+  updateProductMenu,
+};

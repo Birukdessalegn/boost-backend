@@ -1,0 +1,979 @@
+const pool = require("../../config/database");
+
+
+// ============================================================
+// GET ALL KITCHEN ORDERS
+// ============================================================
+
+const getAllKitchenOrders = async () => {
+  const result = await pool.query(`
+    SELECT
+      ko.id,
+      ko.order_id,
+      ko.status,
+      ko.started_at,
+      ko.ready_at,
+      ko.chef_id,
+      ko.notes,
+      ko.created_at,
+
+      o.order_number,
+o.table_id,
+o.order_type,
+o.payment_status,
+
+      rt.table_number,
+
+      e.first_name AS chef_first_name,
+      e.last_name AS chef_last_name,
+
+      o.waiter_id,
+      ew.id AS waiter_employee_id,
+      ew.user_id AS waiter_user_id,
+      uw.username AS waiter_username,
+      ew.first_name AS waiter_first_name,
+      ew.last_name AS waiter_last_name,
+      COALESCE(ew.first_name || ' ' || ew.last_name, uw.username) AS waiter_name
+
+    FROM kitchen_orders ko
+
+    JOIN orders o
+      ON ko.order_id = o.id
+
+    LEFT JOIN restaurant_tables rt
+      ON o.table_id = rt.id
+
+    LEFT JOIN employees e
+      ON ko.chef_id = e.id
+
+    LEFT JOIN employees ew
+      ON o.waiter_id = ew.id
+
+    LEFT JOIN users uw
+      ON ew.user_id = uw.id
+
+    ORDER BY ko.created_at DESC
+  `);
+
+  const orders = result.rows;
+
+  // Get items for every kitchen order
+  for (const order of orders) {
+    const itemsResult = await pool.query(
+      `
+      SELECT
+        koi.id,
+        koi.quantity,
+        koi.status,
+
+        oi.id AS order_item_id,
+        oi.product_id,
+        oi.unit_price,
+        oi.notes AS item_notes,
+
+        p.name AS product_name,
+        COALESCE(p.tags, '') AS tags,
+        pc.name AS category_name,
+        pc.type AS category_type
+
+      FROM kitchen_order_items koi
+
+      JOIN order_items oi
+        ON koi.order_item_id = oi.id
+
+      JOIN products p
+        ON oi.product_id = p.id
+
+      LEFT JOIN product_categories pc
+        ON p.category_id = pc.id
+
+      WHERE koi.kitchen_order_id = $1
+
+      ORDER BY koi.id ASC
+      `,
+      [order.id]
+    );
+
+    order.items = itemsResult.rows;
+  }
+
+  return orders;
+};
+
+
+// ============================================================
+// GET KITCHEN ORDER BY ID
+// ============================================================
+
+const getKitchenOrderById = async (id) => {
+  const numericId = Number(id);
+  if (!Number.isInteger(numericId)) {
+    return null;
+  }
+
+  const orderResult = await pool.query(
+    `
+    SELECT
+      ko.id,
+      ko.order_id,
+      ko.status,
+      ko.started_at,
+      ko.ready_at,
+      ko.chef_id,
+      ko.notes,
+      ko.created_at,
+
+      o.order_number,
+  o.table_id,
+o.order_type,
+o.payment_status,
+
+      rt.table_number
+
+    FROM kitchen_orders ko
+
+    JOIN orders o
+      ON ko.order_id = o.id
+
+    LEFT JOIN restaurant_tables rt
+      ON o.table_id = rt.id
+
+    WHERE ko.id = $1
+    `,
+    [numericId]
+  );
+
+  if (orderResult.rows.length === 0) {
+    return null;
+  }
+
+  const order = orderResult.rows[0];
+
+  const itemsResult = await pool.query(
+    `
+    SELECT
+      koi.id,
+      koi.quantity,
+      koi.status,
+
+      oi.id AS order_item_id,
+      oi.product_id,
+      oi.unit_price,
+      oi.notes AS item_notes,
+
+      p.name AS product_name
+
+    FROM kitchen_order_items koi
+
+    JOIN order_items oi
+      ON koi.order_item_id = oi.id
+
+    JOIN products p
+      ON oi.product_id = p.id
+
+    WHERE koi.kitchen_order_id = $1
+
+    ORDER BY koi.id ASC
+    `,
+    [numericId]
+  );
+
+  order.items = itemsResult.rows;
+
+  return order;
+};
+
+
+// ============================================================
+// CREATE KITCHEN ORDER
+// ============================================================
+
+const createKitchenOrder = async (data) => {
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const {
+      orderId,
+      chefId,
+      notes,
+      items = [],
+    } = data;
+
+    // Create kitchen order
+    const kitchenOrderResult = await client.query(
+      `
+      INSERT INTO kitchen_orders (
+        order_id,
+        chef_id,
+        notes,
+        status
+      )
+      VALUES ($1, $2, $3, 'pending')
+      RETURNING *
+      `,
+      [
+        orderId,
+        chefId || null,
+        notes || null,
+      ]
+    );
+
+    const kitchenOrder = kitchenOrderResult.rows[0];
+
+    // Add kitchen items
+    for (const item of items) {
+      await client.query(
+        `
+        INSERT INTO kitchen_order_items (
+          kitchen_order_id,
+          order_item_id,
+          quantity,
+          status
+        )
+        VALUES ($1, $2, $3, 'pending')
+        `,
+        [
+          kitchenOrder.id,
+          item.orderItemId,
+          item.quantity,
+        ]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    return kitchenOrder;
+
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+
+  } finally {
+    client.release();
+  }
+};
+
+
+// ============================================================
+// UPDATE KITCHEN ORDER STATUS
+// ============================================================
+
+const updateKitchenOrderStatus = async (id, status, chefId, userId = null, reason = "") => {
+  // If cancelling / rejecting, perform full cancellation, stock restoration, and table release
+  if (status === "cancelled" || status === "rejected") {
+    const client = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      // 1. Fetch kitchen order
+      const koRes = await client.query(
+        `SELECT * FROM kitchen_orders WHERE id = $1 FOR UPDATE`,
+        [id]
+      );
+
+      if (koRes.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return null;
+      }
+
+      const kitchenOrder = koRes.rows[0];
+      const noteReason = reason ? `[Refused/Rejected: ${reason}]` : "[Refused/Rejected by Customer]";
+
+      // 2. Update kitchen_orders status to 'cancelled' and append rejection note
+      const updatedKoRes = await client.query(
+        `
+        UPDATE kitchen_orders
+        SET
+          status = 'cancelled',
+          notes = CASE 
+            WHEN notes IS NULL OR notes = '' THEN $1 
+            ELSE notes || ' | ' || $1 
+          END
+        WHERE id = $2
+        RETURNING *
+        `,
+        [noteReason, id]
+      );
+
+      // 3. Update kitchen_order_items to 'cancelled'
+      await client.query(
+        `
+        UPDATE kitchen_order_items
+        SET status = 'cancelled'
+        WHERE kitchen_order_id = $1
+        `,
+        [id]
+      );
+
+      await client.query("COMMIT");
+
+      // 4. Trigger POS stock restoration, table freeing, and order cancellation
+      try {
+        const posService = require("../pos/pos.service");
+        await posService.updateOrderStatus(
+          kitchenOrder.order_id,
+          "cancelled",
+          userId,
+          reason || "Customer refused order at Fruit / Kitchen station"
+        );
+      } catch (posErr) {
+        console.warn("Notice: posService.updateOrderStatus during kitchen rejection:", posErr?.message);
+        // Fallback: make sure order and items are marked cancelled in DB
+        await pool.query(
+          `UPDATE orders SET status = 'cancelled', notes = CASE WHEN notes IS NULL OR notes = '' THEN $1 ELSE notes || ' | ' || $1 END, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+          [noteReason, kitchenOrder.order_id]
+        );
+        await pool.query(
+          `UPDATE order_items SET status = 'cancelled' WHERE order_id = $1`,
+          [kitchenOrder.order_id]
+        );
+      }
+
+      return updatedKoRes.rows[0];
+
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+
+    } finally {
+      client.release();
+    }
+  }
+
+  // Standard non-cancel status update (preparing, ready, served, etc.)
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    let query = `
+      UPDATE kitchen_orders
+      SET
+        status = $1
+    `;
+
+    const values = [status];
+
+    // Preparing
+    if (status === "preparing") {
+      query += `,
+        started_at = CURRENT_TIMESTAMP
+      `;
+    }
+
+    // Ready
+    if (status === "ready") {
+      query += `,
+        ready_at = CURRENT_TIMESTAMP
+      `;
+    }
+
+    // Assign chef
+    if (chefId) {
+      query += `,
+        chef_id = $${values.length + 1}
+      `;
+
+      values.push(chefId);
+    }
+
+    query += `
+      WHERE id = $${values.length + 1}
+      RETURNING *
+    `;
+
+    values.push(id);
+
+    const result = await client.query(query, values);
+
+    if (result.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return null;
+    }
+
+    // Update kitchen items too
+    await client.query(
+      `
+      UPDATE kitchen_order_items
+      SET status = $1
+      WHERE kitchen_order_id = $2
+      `,
+      [status, id]
+    );
+
+    // Also synchronize main order status
+    const kitchenOrder = result.rows[0];
+
+    await client.query(
+      `
+      UPDATE orders
+      SET status = $1,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $2
+      `,
+      [status, kitchenOrder.order_id]
+    );
+
+    await client.query("COMMIT");
+
+    return result.rows[0];
+
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+
+  } finally {
+    client.release();
+  }
+};
+
+
+// ============================================================
+// DELETE KITCHEN ORDER
+// ============================================================
+
+const deleteKitchenOrder = async (id) => {
+  const result = await pool.query(
+    `
+    DELETE FROM kitchen_orders
+    WHERE id = $1
+    RETURNING *
+    `,
+    [id]
+  );
+  return result.rows[0];
+};
+
+// ============================================================
+// GET KITCHEN STOCK AUDITS (AUDIT HISTORY)
+// ============================================================
+
+const getKitchenAudits = async ({ limit = 50, productId, department } = {}) => {
+  let query = `
+    SELECT
+      ksa.id,
+      ksa.product_id,
+      ksa.department,
+      ksa.action,
+      ksa.physical_count_found,
+      ksa.verified_by,
+      ksa.verifier_name,
+      ksa.notes,
+      ksa.created_at,
+
+      p.name AS product_name,
+      p.product_code,
+      p.unit,
+      p.image_url,
+      pc.name AS category_name,
+
+      COALESCE(di.quantity, 0) AS current_kitchen_stock
+
+    FROM kitchen_stock_audits ksa
+    JOIN products p ON ksa.product_id = p.id
+    LEFT JOIN product_categories pc ON p.category_id = pc.id
+    LEFT JOIN department_inventory di ON di.product_id = p.id AND di.department = ksa.department
+    WHERE 1=1
+  `;
+  const params = [];
+
+  if (productId) {
+    params.push(productId);
+    query += ` AND ksa.product_id = $${params.length}`;
+  }
+
+  if (department) {
+    params.push(department.toLowerCase());
+    query += ` AND ksa.department = $${params.length}`;
+  }
+
+  query += ` ORDER BY ksa.created_at DESC`;
+
+  if (limit) {
+    params.push(limit);
+    query += ` LIMIT $${params.length}`;
+  }
+
+  const result = await pool.query(query, params);
+  return result.rows;
+};
+
+// ============================================================
+// VERIFY KITCHEN STOCK / APPROVE OUT-OF-STOCK
+// ============================================================
+
+const verifyKitchenStock = async ({
+  productId,
+  department = "kitchen",
+  action, // 'approved_depleted' | 'rejected_stock_found' | 'verified_in_stock'
+  physicalCountFound = 0,
+  notes,
+  userId,
+  verifierName,
+}) => {
+  if (!productId) {
+    throw new Error("Product ID is required for stock verification.");
+  }
+
+  if (!action || !["approved_depleted", "rejected_stock_found", "verified_in_stock"].includes(action)) {
+    throw new Error("Invalid verification action. Must be 'approved_depleted', 'rejected_stock_found', or 'verified_in_stock'.");
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    // 1. Get product info
+    const prodRes = await client.query(
+      `SELECT id, name, unit FROM products WHERE id = $1`,
+      [productId]
+    );
+
+    if (prodRes.rows.length === 0) {
+      throw new Error(`Product #${productId} not found.`);
+    }
+    const product = prodRes.rows[0];
+
+    // 2. Resolve verifier name if not provided
+    let finalVerifierName = verifierName;
+    if (!finalVerifierName && userId) {
+      const userRes = await client.query(
+        `
+        SELECT u.username, e.first_name, e.last_name
+        FROM users u
+        LEFT JOIN employees e ON e.user_id = u.id
+        WHERE u.id = $1
+        `,
+        [userId]
+      );
+      if (userRes.rows.length > 0) {
+        const u = userRes.rows[0];
+        finalVerifierName = (u.first_name && u.last_name) ? `${u.first_name} ${u.last_name}` : u.username;
+      }
+    }
+
+    const countFound = Number(physicalCountFound || 0);
+
+    // 3. Handle stock updates based on action
+    if (action === "rejected_stock_found" || action === "verified_in_stock") {
+      // The controller found physical stock! Restore it in kitchen sub-store
+      await client.query(
+        `
+        INSERT INTO department_inventory (department, product_id, quantity, unit, updated_at)
+        VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+        ON CONFLICT (department, product_id)
+        DO UPDATE SET quantity = $3, updated_at = CURRENT_TIMESTAMP
+        `,
+        [department, productId, countFound, product.unit || "pcs"]
+      );
+
+      // Record transaction
+      await client.query(
+        `
+        INSERT INTO department_inventory_transactions (
+          department,
+          product_id,
+          transaction_type,
+          quantity,
+          reference_type,
+          notes,
+          created_by
+        )
+        VALUES ($1, $2, 'adjustment_in', $3, 'physical_audit', $4, $5)
+        `,
+        [
+          department,
+          productId,
+          countFound,
+          `F&B Controller found physical stock during kitchen inspection (${notes || "Stock verified in kitchen"})`,
+          userId || null,
+        ]
+      );
+
+      // Ensure product is marked available
+      if (countFound > 0) {
+        await client.query(
+          `UPDATE products SET is_available = TRUE WHERE id = $1`,
+          [productId]
+        );
+      }
+    } else if (action === "approved_depleted") {
+      // Confirmed genuinely depleted / finished
+      await client.query(
+        `
+        INSERT INTO department_inventory (department, product_id, quantity, unit, updated_at)
+        VALUES ($1, $2, 0, $3, CURRENT_TIMESTAMP)
+        ON CONFLICT (department, product_id)
+        DO UPDATE SET quantity = 0, updated_at = CURRENT_TIMESTAMP
+        `,
+        [department, productId, product.unit || "pcs"]
+      );
+
+      await client.query(
+        `
+        INSERT INTO department_inventory_transactions (
+          department,
+          product_id,
+          transaction_type,
+          quantity,
+          reference_type,
+          notes,
+          created_by
+        )
+        VALUES ($1, $2, 'depleted_verified', 0, 'physical_audit', $3, $4)
+        `,
+        [
+          department,
+          productId,
+          `F&B Controller physically verified item is completely depleted in kitchen (${notes || "Confirmed finished"})`,
+          userId || null,
+        ]
+      );
+    }
+
+    // 4. Record audit entry
+    const auditRes = await client.query(
+      `
+      INSERT INTO kitchen_stock_audits (
+        product_id,
+        department,
+        action,
+        physical_count_found,
+        verified_by,
+        verifier_name,
+        notes
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      RETURNING *
+      `,
+      [
+        productId,
+        department,
+        action,
+        countFound,
+        userId || null,
+        finalVerifierName || "F&B Controller",
+        notes || null,
+      ]
+    );
+
+    await client.query("COMMIT");
+    return auditRes.rows[0];
+
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
+// ============================================================
+// F&B STOCK SHORTAGE / DISCREPANCY AUDIT & APPROVAL
+// ============================================================
+
+const createShortageRequest = async ({
+  productId,
+  department = "kitchen",
+  expectedQuantity,
+  physicalCount,
+  reason,
+  notes,
+  userId,
+  requesterName,
+}) => {
+  if (!productId) {
+    throw new Error("Product ID is required for shortage report.");
+  }
+
+  const exp = Number(expectedQuantity || 0);
+  const act = Number(physicalCount || 0);
+  const shortageQty = exp - act;
+
+  if (shortageQty <= 0) {
+    throw new Error("Physical count must be less than recorded stock to report a shortage.");
+  }
+
+  // 1. Fetch product details
+  const prodRes = await pool.query(
+    `SELECT id, name, unit, COALESCE(cost_price, price, 0) AS unit_cost FROM products WHERE id = $1`,
+    [productId]
+  );
+  if (prodRes.rows.length === 0) {
+    throw new Error(`Product #${productId} not found.`);
+  }
+  const product = prodRes.rows[0];
+  const unitCost = Number(product.unit_cost || 0);
+  const totalLoss = Number((shortageQty * unitCost).toFixed(2));
+
+  // 2. Resolve requester name
+  let finalRequester = requesterName;
+  if (!finalRequester && userId) {
+    const userRes = await pool.query(
+      `
+      SELECT u.username, e.first_name, e.last_name
+      FROM users u
+      LEFT JOIN employees e ON e.user_id = u.id
+      WHERE u.id = $1
+      `,
+      [userId]
+    );
+    if (userRes.rows.length > 0) {
+      const u = userRes.rows[0];
+      finalRequester = (u.first_name && u.last_name) ? `${u.first_name} ${u.last_name}` : u.username;
+    }
+  }
+
+  const insertRes = await pool.query(
+    `
+    INSERT INTO stock_shortage_requests (
+      product_id,
+      department,
+      expected_quantity,
+      physical_count,
+      shortage_quantity,
+      unit_cost,
+      total_loss_value,
+      reason,
+      notes,
+      status,
+      requested_by,
+      requester_name
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending_approval', $10, $11)
+    RETURNING *
+    `,
+    [
+      productId,
+      department.toLowerCase(),
+      exp,
+      act,
+      shortageQty,
+      unitCost,
+      totalLoss,
+      reason || "unaccounted_missing",
+      notes || null,
+      userId || null,
+      finalRequester || "F&B Controller",
+    ]
+  );
+
+  const createdShortage = insertRes.rows[0];
+
+  // Send real-time notification to Admins and Managers
+  try {
+    const notificationsService = require("../notifications/notifications.service");
+    await notificationsService.createNotification({
+      targetRoles: ["admin", "manager"],
+      title: `Stock Shortage Alert: ${product.name}`,
+      message: `${finalRequester || "F&B Controller"} reported a shortage of ${shortageQty} ${product.unit || "units"} in ${department.toUpperCase()} (${totalLoss.toFixed(2)} ETB loss). Requires Manager approval.`,
+      type: "warning",
+      referenceType: "stock_shortage",
+      referenceId: createdShortage.id,
+    });
+  } catch (notifErr) {
+    console.error("Failed to dispatch shortage notification:", notifErr.message);
+  }
+
+  return createdShortage;
+};
+
+const getShortageRequests = async ({ status, department, limit = 100 } = {}) => {
+  let query = `
+    SELECT 
+      ssr.*,
+      p.name AS product_name,
+      p.product_code,
+      p.unit,
+      p.image_url,
+      pc.name AS category_name,
+      COALESCE(di.quantity, 0) AS live_inventory_stock
+    FROM stock_shortage_requests ssr
+    JOIN products p ON ssr.product_id = p.id
+    LEFT JOIN product_categories pc ON p.category_id = pc.id
+    LEFT JOIN department_inventory di ON di.product_id = p.id AND di.department = ssr.department
+    WHERE 1=1
+  `;
+  const params = [];
+
+  if (status && status !== "all") {
+    params.push(status);
+    query += ` AND ssr.status = $${params.length}`;
+  }
+
+  if (department && department !== "all") {
+    params.push(department.toLowerCase());
+    query += ` AND ssr.department = $${params.length}`;
+  }
+
+  query += ` ORDER BY ssr.created_at DESC`;
+
+  if (limit) {
+    params.push(limit);
+    query += ` LIMIT $${params.length}`;
+  }
+
+  const result = await pool.query(query, params);
+  return result.rows;
+};
+
+const reviewShortageRequest = async ({
+  requestId,
+  action, // 'approve' | 'reject'
+  reviewNotes,
+  userId,
+  reviewerName,
+}) => {
+  if (!requestId) {
+    throw new Error("Shortage request ID is required.");
+  }
+  if (!["approve", "reject"].includes(action)) {
+    throw new Error("Action must be either 'approve' or 'reject'.");
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const reqRes = await client.query(
+      `SELECT * FROM stock_shortage_requests WHERE id = $1 FOR UPDATE`,
+      [requestId]
+    );
+    if (reqRes.rows.length === 0) {
+      throw new Error(`Shortage request #${requestId} not found.`);
+    }
+
+    const shortage = reqRes.rows[0];
+    if (shortage.status !== "pending_approval") {
+      throw new Error(`This shortage request has already been ${shortage.status}.`);
+    }
+
+    // Resolve reviewer name
+    let finalReviewer = reviewerName;
+    if (!finalReviewer && userId) {
+      const userRes = await client.query(
+        `
+        SELECT u.username, e.first_name, e.last_name
+        FROM users u
+        LEFT JOIN employees e ON e.user_id = u.id
+        WHERE u.id = $1
+        `,
+        [userId]
+      );
+      if (userRes.rows.length > 0) {
+        const u = userRes.rows[0];
+        finalReviewer = (u.first_name && u.last_name) ? `${u.first_name} ${u.last_name}` : u.username;
+      }
+    }
+
+    const newStatus = action === "approve" ? "approved" : "rejected";
+
+    if (action === "approve") {
+      // 1. Update sub-store inventory to the physical count
+      await client.query(
+        `
+        INSERT INTO department_inventory (department, product_id, quantity, updated_at)
+        VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+        ON CONFLICT (department, product_id)
+        DO UPDATE SET quantity = $3, updated_at = CURRENT_TIMESTAMP
+        `,
+        [shortage.department, shortage.product_id, shortage.physical_count]
+      );
+
+      // 2. Record official inventory transaction
+      await client.query(
+        `
+        INSERT INTO department_inventory_transactions (
+          department,
+          product_id,
+          transaction_type,
+          quantity,
+          reference_type,
+          reference_id,
+          notes,
+          created_by
+        )
+        VALUES ($1, $2, 'shortage_writeoff', $3, 'shortage_request', $4, $5, $6)
+        `,
+        [
+          shortage.department,
+          shortage.product_id,
+          -Number(shortage.shortage_quantity),
+          shortage.id,
+          `Manager approved shortage write-off: -${shortage.shortage_quantity} (${reviewNotes || shortage.reason})`,
+          userId || null,
+        ]
+      );
+    }
+
+    // 3. Update shortage request status
+    const updateRes = await client.query(
+      `
+      UPDATE stock_shortage_requests
+      SET 
+        status = $1,
+        reviewed_by = $2,
+        reviewer_name = $3,
+        review_notes = $4,
+        reviewed_at = CURRENT_TIMESTAMP
+      WHERE id = $5
+      RETURNING *
+      `,
+      [
+        newStatus,
+        userId || null,
+        finalReviewer || "Manager / Admin",
+        reviewNotes || null,
+        requestId,
+      ]
+    );
+
+    await client.query("COMMIT");
+    const reviewedRecord = updateRes.rows[0];
+
+    // Notify requester about decision
+    if (shortage.requested_by) {
+      try {
+        const notificationsService = require("../notifications/notifications.service");
+        await notificationsService.createNotification({
+          userId: shortage.requested_by,
+          title: action === "approve" ? `Shortage Approved: ${shortage.product_name}` : `Shortage Rejected: ${shortage.product_name}`,
+          message: action === "approve"
+            ? `Your shortage report for "${shortage.product_name}" in ${shortage.department.toUpperCase()} was approved by ${finalReviewer}. Stock numbers have been updated.`
+            : `Your shortage report for "${shortage.product_name}" in ${shortage.department.toUpperCase()} was rejected by ${finalReviewer}. Note: ${reviewNotes || "No explanation provided."}`,
+          type: action === "approve" ? "success" : "warning",
+          referenceType: "stock_shortage",
+          referenceId: requestId,
+        });
+      } catch (notifErr) {
+        console.error("Failed to notify requester about review:", notifErr.message);
+      }
+    }
+
+    return reviewedRecord;
+
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
+module.exports = {
+  getAllKitchenOrders,
+  getKitchenOrderById,
+  createKitchenOrder,
+  updateKitchenOrderStatus,
+  deleteKitchenOrder,
+  getKitchenAudits,
+  verifyKitchenStock,
+  createShortageRequest,
+  getShortageRequests,
+  reviewShortageRequest,
+};
