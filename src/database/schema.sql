@@ -398,6 +398,8 @@ CREATE TABLE IF NOT EXISTS products (
     allow_full_bottle BOOLEAN DEFAULT TRUE,
     applicable_for VARCHAR(50) DEFAULT 'both',
     tags VARCHAR(255) DEFAULT '',
+    low_stock_threshold NUMERIC(12,2) DEFAULT 5,
+    out_of_stock_threshold NUMERIC(12,2) DEFAULT 0,
 
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
@@ -1254,6 +1256,7 @@ CREATE TABLE IF NOT EXISTS department_inventory (
     quantity NUMERIC(12,3) NOT NULL DEFAULT 0,
     minimum_stock NUMERIC(12,3) NOT NULL DEFAULT 5,
     maximum_stock NUMERIC(12,3),
+    out_of_stock_threshold NUMERIC(12,2) DEFAULT 0,
     unit VARCHAR(30) DEFAULT 'pcs',
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(department, product_id)
@@ -1276,6 +1279,11 @@ CREATE TABLE IF NOT EXISTS stock_transfers (
     requested_by UUID REFERENCES users(id),
     dispatched_by UUID REFERENCES users(id),
     received_by UUID REFERENCES users(id),
+    approved_by UUID REFERENCES users(id),
+    approved_at TIMESTAMP,
+    rejection_reason TEXT,
+    received_at TIMESTAMP,
+    receiving_notes TEXT,
     notes TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
