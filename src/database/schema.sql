@@ -628,6 +628,110 @@ CREATE TABLE IF NOT EXISTS reservations (
 
 
 -- ============================================================
+-- CASHIER SHIFTS & RECONCILIATION
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS cashier_shifts (
+    id SERIAL PRIMARY KEY,
+
+    cashier_id UUID NOT NULL REFERENCES users(id)
+        ON DELETE CASCADE,
+
+    cashier_name VARCHAR(150),
+
+    terminal_id INTEGER DEFAULT 1,
+
+    start_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    end_time TIMESTAMP,
+
+    opening_cash NUMERIC(12,2) DEFAULT 0.00,
+
+    expected_cash NUMERIC(12,2) DEFAULT 0.00,
+
+    actual_cash NUMERIC(12,2) DEFAULT 0.00,
+
+    shortage_overage NUMERIC(12,2) DEFAULT 0.00,
+
+    total_card_sales NUMERIC(12,2) DEFAULT 0.00,
+
+    total_mobile_sales NUMERIC(12,2) DEFAULT 0.00,
+
+    total_credit_sales NUMERIC(12,2) DEFAULT 0.00,
+
+    total_repayments_cash NUMERIC(12,2) DEFAULT 0.00,
+
+    total_expenses_cash NUMERIC(12,2) DEFAULT 0.00,
+
+    total_refunds_cash NUMERIC(12,2) DEFAULT 0.00,
+
+    total_sales NUMERIC(12,2) DEFAULT 0.00,
+
+    total_orders_count INTEGER DEFAULT 0,
+
+    status VARCHAR(30) DEFAULT 'open',
+
+    cashier_notes TEXT,
+
+    verified_by UUID REFERENCES users(id),
+
+    verified_by_name VARCHAR(150),
+
+    verified_at TIMESTAMP,
+
+    verification_notes TEXT,
+
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_cashier_shifts_status
+ON cashier_shifts(status);
+
+CREATE INDEX IF NOT EXISTS idx_cashier_shifts_cashier
+ON cashier_shifts(cashier_id);
+
+CREATE INDEX IF NOT EXISTS idx_cashier_shifts_cashier_status
+ON cashier_shifts(cashier_id, status);
+
+
+-- ============================================================
+-- VIP CUSTOMERS & REPAYMENTS
+-- ============================================================
+
+-- 1. VIP / Credit Customer Directory Table
+CREATE TABLE IF NOT EXISTS vip_customers (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    phone VARCHAR(50) NOT NULL UNIQUE,
+    tier VARCHAR(50) DEFAULT 'Gold VIP',
+    credit_limit NUMERIC(12, 2) DEFAULT 10000.00,
+    current_debt NUMERIC(12, 2) DEFAULT 0.00,
+    company VARCHAR(255),
+    notes TEXT,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 2. Repayment Transactions History Table
+CREATE TABLE IF NOT EXISTS customer_repayments (
+    id SERIAL PRIMARY KEY,
+    customer_id INT NOT NULL REFERENCES vip_customers(id) ON DELETE CASCADE,
+    amount NUMERIC(12, 2) NOT NULL,
+    payment_method VARCHAR(50) DEFAULT 'cash',
+    reference VARCHAR(255),
+    notes TEXT,
+    received_by UUID REFERENCES users(id),
+    cashier_shift_id INTEGER REFERENCES cashier_shifts(id) ON DELETE SET NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+
+-- ============================================================
+
+-- ============================================================
 -- POS ORDERS
 -- ============================================================
 
@@ -1140,109 +1244,6 @@ CREATE INDEX IF NOT EXISTS idx_notifications_unread
 ON notifications(user_id, is_read);
 
 
--- ============================================================
--- CASHIER SHIFTS & RECONCILIATION
--- ============================================================
-
-CREATE TABLE IF NOT EXISTS cashier_shifts (
-    id SERIAL PRIMARY KEY,
-
-    cashier_id UUID NOT NULL REFERENCES users(id)
-        ON DELETE CASCADE,
-
-    cashier_name VARCHAR(150),
-
-    terminal_id INTEGER DEFAULT 1,
-
-    start_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-
-    end_time TIMESTAMP,
-
-    opening_cash NUMERIC(12,2) DEFAULT 0.00,
-
-    expected_cash NUMERIC(12,2) DEFAULT 0.00,
-
-    actual_cash NUMERIC(12,2) DEFAULT 0.00,
-
-    shortage_overage NUMERIC(12,2) DEFAULT 0.00,
-
-    total_card_sales NUMERIC(12,2) DEFAULT 0.00,
-
-    total_mobile_sales NUMERIC(12,2) DEFAULT 0.00,
-
-    total_credit_sales NUMERIC(12,2) DEFAULT 0.00,
-
-    total_repayments_cash NUMERIC(12,2) DEFAULT 0.00,
-
-    total_expenses_cash NUMERIC(12,2) DEFAULT 0.00,
-
-    total_refunds_cash NUMERIC(12,2) DEFAULT 0.00,
-
-    total_sales NUMERIC(12,2) DEFAULT 0.00,
-
-    total_orders_count INTEGER DEFAULT 0,
-
-    status VARCHAR(30) DEFAULT 'open',
-
-    cashier_notes TEXT,
-
-    verified_by UUID REFERENCES users(id),
-
-    verified_by_name VARCHAR(150),
-
-    verified_at TIMESTAMP,
-
-    verification_notes TEXT,
-
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX IF NOT EXISTS idx_cashier_shifts_status
-ON cashier_shifts(status);
-
-CREATE INDEX IF NOT EXISTS idx_cashier_shifts_cashier
-ON cashier_shifts(cashier_id);
-
-CREATE INDEX IF NOT EXISTS idx_cashier_shifts_cashier_status
-ON cashier_shifts(cashier_id, status);
-
-
--- ============================================================
--- VIP CUSTOMERS & REPAYMENTS
--- ============================================================
-
--- 1. VIP / Credit Customer Directory Table
-CREATE TABLE IF NOT EXISTS vip_customers (
-    id SERIAL PRIMARY KEY,
-    name VARCHAR(255) NOT NULL,
-    phone VARCHAR(50) NOT NULL UNIQUE,
-    tier VARCHAR(50) DEFAULT 'Gold VIP',
-    credit_limit NUMERIC(12, 2) DEFAULT 10000.00,
-    current_debt NUMERIC(12, 2) DEFAULT 0.00,
-    company VARCHAR(255),
-    notes TEXT,
-    is_active BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- 2. Repayment Transactions History Table
-CREATE TABLE IF NOT EXISTS customer_repayments (
-    id SERIAL PRIMARY KEY,
-    customer_id INT NOT NULL REFERENCES vip_customers(id) ON DELETE CASCADE,
-    amount NUMERIC(12, 2) NOT NULL,
-    payment_method VARCHAR(50) DEFAULT 'cash',
-    reference VARCHAR(255),
-    notes TEXT,
-    received_by UUID REFERENCES users(id),
-    cashier_shift_id INTEGER REFERENCES cashier_shifts(id) ON DELETE SET NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-
--- ============================================================
 -- DEPARTMENT INVENTORY (OUTLET SUB-STORES: BAR & KITCHEN)
 -- ============================================================
 
